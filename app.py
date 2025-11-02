@@ -39,44 +39,75 @@ def load_card_data():
 
 df = load_card_data()
 
-# Function to get recommendations
+# Function to get recommendations - OPTIMIZED VERSION
 def get_card_recommendations(user_query, card_data, num_recommendations=5):
-    # Prepare card data for GPT
-    cards_text = "\n\n".join([
-        f"Card {i+1}: {row['card_name']}\nPerks: {row['perks_summary']}"
-        for i, row in card_data.iterrows()
-    ])
+    # First, use GPT to filter relevant cards (cheaper, faster)
+    cards_summary = f"Total cards available: {len(card_data)}\n\n"
+    cards_summary += "Card names:\n" + "\n".join([f"{i+1}. {row['card_name']}" for i, row in card_data.head(50).iterrows()])
     
-    system_prompt = f"""You are an expert credit card advisor. You have access to a database of {len(card_data)} credit cards.
+    filter_prompt = f"""Based on this user question: "{user_query}"
 
-Your task is to analyze the user's question and recommend the top {num_recommendations} credit cards that best match their needs.
+Here are the first 50 card names from our database of {len(card_data)} cards:
+{cards_summary}
 
-For each recommendation:
-1. Provide the exact card name
-2. Explain why it's a good match for the user's specific query
-3. Highlight the most relevant perks
-
-Format your response as a JSON array with this structure:
-[
-  {{
-    "card_name": "exact card name from database",
-    "why_recommended": "explanation of why this card matches the user's needs",
-    "key_perks": "most relevant perks for this user"
-  }}
-]
-
-Be specific and focus on perks that directly address the user's question."""
-
-    user_prompt = f"""User Question: {user_query}
-
-Available Credit Cards:
-{cards_text}
-
-Please recommend the top {num_recommendations} credit cards for this user's needs. Return your response as a JSON array."""
+Which card names seem most relevant? List 10-15 card names that might match the user's needs.
+Just list the card names, one per line."""
 
     try:
+        # Step 1: Filter to relevant cards
+        filter_response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Cheaper model for filtering
+            messages=[
+                {"role": "system", "content": "You are a credit card expert. Filter cards by name relevance."},
+                {"role": "user", "content": filter_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+        
+        relevant_names = filter_response.choices[0].message.content.strip().split('\n')
+        relevant_names = [name.strip('- ').strip('0123456789. ').strip() for name in relevant_names if name.strip()]
+        
+        # Step 2: Get full details for filtered cards
+        filtered_cards = card_data[card_data['card_name'].isin(relevant_names)]
+        
+        # If no matches, use keyword search as fallback
+        if len(filtered_cards) == 0:
+            query_lower = user_query.lower()
+            filtered_cards = card_data[
+                card_data['card_name'].str.lower().str.contains('|'.join(['travel', 'cash', 'grocery', 'gas', 'dining', 'rewards']), na=False) |
+                card_data['perks_summary'].str.lower().str.contains('|'.join(['travel', 'cash', 'grocery', 'gas', 'dining', 'rewards']), na=False)
+            ].head(20)
+        
+        # Prepare detailed data for final recommendations
+        cards_text = "\n\n".join([
+            f"Card {i+1}: {row['card_name']}\nPerks: {row['perks_summary']}"
+            for i, row in filtered_cards.head(20).iterrows()
+        ])
+        
+        system_prompt = f"""You are an expert credit card advisor analyzing a filtered set of relevant cards.
+
+Recommend the top {num_recommendations} credit cards that best match the user's needs.
+
+Format as JSON array:
+[
+  {{
+    "card_name": "exact card name",
+    "why_recommended": "explanation",
+    "key_perks": "relevant perks"
+  }}
+]"""
+
+        user_prompt = f"""User Question: {user_query}
+
+Relevant Credit Cards:
+{cards_text}
+
+Recommend the top {num_recommendations} cards. Return only JSON array."""
+
+        # Step 3: Get final recommendations
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",  # Using mini model to save costs
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -88,7 +119,6 @@ Please recommend the top {num_recommendations} credit cards for this user's need
         result = response.choices[0].message.content
         recommendations = json.loads(result)
         
-        # Handle if the response is wrapped in an object
         if isinstance(recommendations, dict):
             if 'recommendations' in recommendations:
                 recommendations = recommendations['recommendations']
@@ -161,4 +191,4 @@ if prompt := st.chat_input("Ask me about credit cards..."):
 
 # Footer
 st.markdown("---")
-st.markdown("*Powered by OpenAI GPT-4 | Built with Streamlit*")
+st.markdown("*Powered by OpenAI GPT-4o-mini | Built with Streamlit*")
