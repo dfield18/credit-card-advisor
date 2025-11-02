@@ -119,16 +119,33 @@ Recommend the top {num_recommendations} cards. Return only JSON array."""
         result = response.choices[0].message.content
         recommendations = json.loads(result)
         
+        # Handle different response formats
         if isinstance(recommendations, dict):
             if 'recommendations' in recommendations:
                 recommendations = recommendations['recommendations']
             elif 'cards' in recommendations:
                 recommendations = recommendations['cards']
+            else:
+                # If dict but no known key, try to extract first list value
+                for key, value in recommendations.items():
+                    if isinstance(value, list):
+                        recommendations = value
+                        break
+        
+        # Ensure we have a list
+        if not isinstance(recommendations, list):
+            recommendations = [recommendations] if recommendations else []
         
         return recommendations[:num_recommendations]
     
+    except json.JSONDecodeError as e:
+        st.error(f"Error parsing response: {str(e)}")
+        return []
     except Exception as e:
         st.error(f"Error getting recommendations: {str(e)}")
+        # Add more debug info
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
         return []
 
 # App UI
