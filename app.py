@@ -39,80 +39,66 @@ def load_card_data():
 
 df = load_card_data()
 
-# Function to get recommendations - OPTIMIZED VERSION
+# Function to get recommendations - FASTEST VERSION (Single API Call)
 def get_card_recommendations(user_query, card_data, num_recommendations=5):
-    # First, use GPT to filter relevant cards (cheaper, faster)
-    cards_summary = f"Total cards available: {len(card_data)}\n\n"
-    cards_summary += "Card names:\n" + "\n".join([f"{i+1}. {row['card_name']}" for i, row in card_data.head(50).iterrows()])
-    
-    filter_prompt = f"""Based on this user question: "{user_query}"
-
-Here are the first 50 card names from our database of {len(card_data)} cards:
-{cards_summary}
-
-Which card names seem most relevant? List 10-15 card names that might match the user's needs.
-Just list the card names, one per line."""
-
     try:
-        # Step 1: Filter to relevant cards
-        filter_response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Cheaper model for filtering
-            messages=[
-                {"role": "system", "content": "You are a credit card expert. Filter cards by name relevance."},
-                {"role": "user", "content": filter_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=500
-        )
+        # FAST keyword-based pre-filtering (no AI needed - instant)
+        query_lower = user_query.lower()
+        keywords = {
+            'travel': ['travel', 'flight', 'airline', 'hotel', 'vacation', 'trip'],
+            'dining': ['dining', 'restaurant', 'food', 'eat', 'meal'],
+            'grocery': ['grocery', 'groceries', 'supermarket', 'food shopping'],
+            'gas': ['gas', 'fuel', 'station', 'petrol'],
+            'cash': ['cash', 'back', 'cashback', 'rebate'],
+            'business': ['business', 'corporate', 'company'],
+            'luxury': ['luxury', 'premium', 'exclusive', 'elite'],
+            'no fee': ['no fee', 'no annual', 'free', 'zero fee'],
+            'rewards': ['rewards', 'points', 'miles'],
+            'bonus': ['bonus', 'sign up', 'welcome']
+        }
         
-        relevant_names = filter_response.choices[0].message.content.strip().split('\n')
-        relevant_names = [name.strip('- ').strip('0123456789. ').strip() for name in relevant_names if name.strip()]
+        # Find relevant keywords in query
+        matched_keywords = []
+        for category, terms in keywords.items():
+            if any(term in query_lower for term in terms):
+                matched_keywords.extend(terms)
         
-        # Step 2: Get full details for filtered cards
-        filtered_cards = card_data[card_data['card_name'].isin(relevant_names)]
-        
-        # If no matches, use keyword search as fallback
-        if len(filtered_cards) == 0:
-            query_lower = user_query.lower()
+        # If we found keywords, use them for fast filtering
+        if matched_keywords:
+            pattern = '|'.join(matched_keywords)
             filtered_cards = card_data[
-                card_data['card_name'].str.lower().str.contains('|'.join(['travel', 'cash', 'grocery', 'gas', 'dining', 'rewards']), na=False) |
-                card_data['perks_summary'].str.lower().str.contains('|'.join(['travel', 'cash', 'grocery', 'gas', 'dining', 'rewards']), na=False)
-            ].head(20)
+                card_data['card_name'].str.lower().str.contains(pattern, na=False, case=False) |
+                card_data['perks_summary'].str.lower().str.contains(pattern, na=False, case=False)
+            ].head(30)
+        else:
+            # Fallback: take first 30 cards
+            filtered_cards = card_data.head(30)
         
-        # Prepare detailed data for final recommendations
+        # If still no matches, use all data (limited)
+        if len(filtered_cards) == 0:
+            filtered_cards = card_data.head(30)
+        
+        # Prepare data for single AI call
         cards_text = "\n\n".join([
-            f"Card {i+1}: {row['card_name']}\nPerks: {row['perks_summary']}"
-            for i, row in filtered_cards.head(20).iterrows()
+            f"{i+1}. {row['card_name']}: {row['perks_summary']}"
+            for i, row in filtered_cards.iterrows()
         ])
         
-        system_prompt = f"""You are an expert credit card advisor analyzing a filtered set of relevant cards.
+        # Single AI call with concise prompt
+        prompt = f"""User needs: {user_query}
 
-Recommend the top {num_recommendations} credit cards that best match the user's needs.
-
-Format as JSON array:
-[
-  {{
-    "card_name": "exact card name",
-    "why_recommended": "explanation",
-    "key_perks": "relevant perks"
-  }}
-]"""
-
-        user_prompt = f"""User Question: {user_query}
-
-Relevant Credit Cards:
+Cards (showing {len(filtered_cards)} most relevant):
 {cards_text}
 
-Recommend the top {num_recommendations} cards. Return only JSON array."""
+Return JSON with top {num_recommendations} recommendations:
+{{"recommendations": [{{"card_name": "name", "why_recommended": "brief reason", "key_perks": "main perks"}}]}}"""
 
-        # Step 3: Get final recommendations
+        # Single fast API call
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Using mini model to save costs
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3,
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1200,
             response_format={"type": "json_object"}
         )
         
@@ -143,9 +129,6 @@ Recommend the top {num_recommendations} cards. Return only JSON array."""
         return []
     except Exception as e:
         st.error(f"Error getting recommendations: {str(e)}")
-        # Add more debug info
-        import traceback
-        st.error(f"Traceback: {traceback.format_exc()}")
         return []
 
 # App UI
