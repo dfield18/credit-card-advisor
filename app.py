@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from openai import OpenAI
 import json
+import re
 
 # Page configuration
 st.set_page_config(
@@ -39,96 +40,133 @@ def load_card_data():
 
 df = load_card_data()
 
-# Function to get recommendations - FASTEST VERSION (Single API Call)
-def get_card_recommendations(user_query, card_data, num_recommendations=5):
-    try:
-        # FAST keyword-based pre-filtering (no AI needed - instant)
-        query_lower = user_query.lower()
-        keywords = {
-            'travel': ['travel', 'flight', 'airline', 'hotel', 'vacation', 'trip'],
-            'dining': ['dining', 'restaurant', 'food', 'eat', 'meal'],
-            'grocery': ['grocery', 'groceries', 'supermarket', 'food shopping'],
-            'gas': ['gas', 'fuel', 'station', 'petrol'],
-            'cash': ['cash', 'back', 'cashback', 'rebate'],
-            'business': ['business', 'corporate', 'company'],
-            'luxury': ['luxury', 'premium', 'exclusive', 'elite'],
-            'no fee': ['no fee', 'no annual', 'free', 'zero fee'],
-            'rewards': ['rewards', 'points', 'miles'],
-            'bonus': ['bonus', 'sign up', 'welcome']
-        }
-        
-        # Find relevant keywords in query
-        matched_keywords = []
-        for category, terms in keywords.items():
-            if any(term in query_lower for term in terms):
-                matched_keywords.extend(terms)
-        
-        # If we found keywords, use them for fast filtering
-        if matched_keywords:
-            pattern = '|'.join(matched_keywords)
-            filtered_cards = card_data[
-                card_data['card_name'].str.lower().str.contains(pattern, na=False, case=False) |
-                card_data['perks_summary'].str.lower().str.contains(pattern, na=False, case=False)
-            ].head(30)
-        else:
-            # Fallback: take first 30 cards
-            filtered_cards = card_data.head(30)
-        
-        # If still no matches, use all data (limited)
-        if len(filtered_cards) == 0:
-            filtered_cards = card_data.head(30)
-        
-        # Prepare data for single AI call
-        cards_text = "\n\n".join([
-            f"{i+1}. {row['card_name']}: {row['perks_summary']}"
-            for i, row in filtered_cards.iterrows()
-        ])
-        
-        # Single AI call with concise prompt
-        prompt = f"""User needs: {user_query}
+# Normalize query for better cache matching
+def normalize_query(query):
+    """Convert query to normalized form - similar queries will match"""
+    # Lowercase and remove punctuation
+    normalized = query.lower()
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    # Remove common stopwords
+    stopwords = {'what', 'is', 'the', 'a', 'an', 'for', 'which', 'should', 'i', 'get', 'me', 'my', 'whats', 'best', 'good', 'top'}
+    words = [w for w in normalized.split() if w not in stopwords]
+    # Sort words for consistency ("travel card" = "card travel")
+    return ' '.join(sorted(words))
 
-Cards (showing {len(filtered_cards)} most relevant):
+# ULTRA-FAST keyword filtering with caching
+@st.cache_data(ttl=3600)
+def smart_filter_cards(query_lower, _card_data):
+    """Fast keyword-based filtering with caching"""
+    keywords = {
+        'travel': ['travel', 'flight', 'airline', 'hotel', 'vacation', 'trip'],
+        'dining': ['dining', 'restaurant', 'food', 'eat', 'meal'],
+        'grocery': ['grocery', 'groceries', 'supermarket'],
+        'gas': ['gas', 'fuel', 'station', 'petrol'],
+        'cash': ['cash back', 'cashback', 'rebate'],
+        'business': ['business', 'corporate'],
+        'luxury': ['luxury', 'premium', 'exclusive'],
+        'fee': ['no fee', 'no annual', 'free', 'zero'],
+        'rewards': ['rewards', 'points', 'miles'],
+        'bonus': ['bonus', 'sign up', 'welcome']
+    }
+    
+    matched_keywords = []
+    for category, terms in keywords.items():
+        if any(term in query_lower for term in terms):
+            matched_keywords.extend(terms)
+    
+    if matched_keywords:
+        pattern = '|'.join(matched_keywords)
+        mask = (
+            _card_data['card_name'].str.lower().str.contains(pattern, na=False, case=False, regex=True) |
+            _card_data['perks_summary'].str.lower().str.contains(pattern, na=False, case=False, regex=True)
+        )
+        filtered = _card_data[mask].head(10)  # Reduced to 10 for speed
+        if len(filtered) > 0:
+            return filtered
+    
+    return _card_data.head(10)  # Reduced to 10 for speed
+
+# Cache AI responses based on normalized queries
+@st.cache_data(ttl=86400, show_spinner=False)  # Cache for 24 hours
+def get_ai_recommendations(normalized_query, cards_text, num_recommendations):
+    """Cached AI call - similar queries return instantly"""
+    
+    prompt = f"""Query: {normalized_query}
+
+Cards:
 {cards_text}
 
-Return JSON with top {num_recommendations} recommendations:
-{{"recommendations": [{{"card_name": "name", "why_recommended": "brief reason", "key_perks": "main perks"}}]}}"""
+JSON format:
+{{"recs":[{{"name":"card name","why":"1 sentence","perks":"key benefits"}}]}}
 
-        # Single fast API call
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1200,
-            response_format={"type": "json_object"}
-        )
+Top {num_recommendations} only."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=400,  # Reduced for even faster response
+        top_p=0.1,
+        frequency_penalty=0,
+        presence_penalty=0,
+        response_format={"type": "json_object"}
+    )
+    
+    return response.choices[0].message.content
+
+# Main recommendation function
+def get_card_recommendations(user_query, card_data, num_recommendations=5):
+    try:
+        # Normalize query for cache matching
+        normalized = normalize_query(user_query)
+        query_lower = user_query.lower()
         
-        result = response.choices[0].message.content
+        # Step 1: Fast filter (cached)
+        filtered_cards = smart_filter_cards(query_lower, card_data)
+        
+        # Step 2: Prepare minimal data
+        cards_list = []
+        for _, row in filtered_cards.iterrows():
+            perk_short = row['perks_summary'][:150] + "..." if len(row['perks_summary']) > 150 else row['perks_summary']
+            cards_list.append(f"{row['card_name']}: {perk_short}")
+        
+        cards_text = "\n".join(cards_list)
+        
+        # Step 3: Get AI recommendations (CACHED - instant for similar queries!)
+        result = get_ai_recommendations(normalized, cards_text, num_recommendations)
+        
         recommendations = json.loads(result)
         
-        # Handle different response formats
+        # Parse response
         if isinstance(recommendations, dict):
-            if 'recommendations' in recommendations:
+            if 'recs' in recommendations:
+                recommendations = recommendations['recs']
+            elif 'recommendations' in recommendations:
                 recommendations = recommendations['recommendations']
             elif 'cards' in recommendations:
                 recommendations = recommendations['cards']
             else:
-                # If dict but no known key, try to extract first list value
                 for key, value in recommendations.items():
                     if isinstance(value, list):
                         recommendations = value
                         break
         
-        # Ensure we have a list
         if not isinstance(recommendations, list):
             recommendations = [recommendations] if recommendations else []
         
-        return recommendations[:num_recommendations]
+        # Normalize keys
+        normalized_recs = []
+        for rec in recommendations[:num_recommendations]:
+            normalized_recs.append({
+                'card_name': rec.get('name') or rec.get('card_name', 'Unknown'),
+                'why_recommended': rec.get('why') or rec.get('why_recommended', 'Good match'),
+                'key_perks': rec.get('perks') or rec.get('key_perks', 'See card details')
+            })
+        
+        return normalized_recs
     
-    except json.JSONDecodeError as e:
-        st.error(f"Error parsing response: {str(e)}")
-        return []
     except Exception as e:
-        st.error(f"Error getting recommendations: {str(e)}")
+        st.error(f"Error: {str(e)}")
         return []
 
 # App UI
@@ -147,6 +185,8 @@ with st.sidebar:
     st.markdown("- I spend a lot on groceries, which card should I get?")
     st.markdown("- Best card for cash back on gas?")
     st.markdown("- Which card has the best sign-up bonus?")
+    st.markdown("---")
+    st.markdown("💡 **Tip**: Similar questions get instant cached results!")
 
 # Initialize chat history
 if "messages" not in st.session_state:
